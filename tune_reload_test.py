@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Sun Oct 23 19:32:16 2022
+Created on Tue May  2 10:43:12 2023
 
 @author: Jorgen Svane
 """
@@ -11,90 +11,154 @@ import numpy as np
 import ray
 from ray import air, tune
 import ray.rllib.algorithms.ppo as ppo
+from ray.rllib.algorithms.ppo import PPOConfig
 
 ray.init()
 
-config = ppo.DEFAULT_CONFIG.copy()
-config["env"] = "CartPole-v0"
-config["num_gpus"] = 0
-config["num_workers"] = 1
-config["framework"] = "tf2"
-config["eager_tracing"] = True
-config["lr"] = tune.grid_search([0.01, 0.001, 0.0001])
-
-# fist tuning to actually get a trained agent
-results = tune.Tuner(
+config = PPOConfig()\
+        .training(lr=tune.grid_search([0.01, 0.001, 0.0001]))\
+        .rollouts(num_rollout_workers=4)\
+        .framework(framework="tf2",eager_tracing=True)\
+        .resources(num_gpus=0)\
+        .environment(env="CartPole-v1")
+    
+# fist tuning to actually get a trained algo
+tuner = tune.Tuner(
     "PPO",
-    run_config=air.RunConfig(stop={"training_iteration": 30,
-                                    "episode_reward_mean": 200},
+    run_config=air.RunConfig(stop={"training_iteration": 100,
+                                    "episode_reward_mean": 500},
                               local_dir="ppo_test"),
     param_space=config
     )
 
-results.fit()
+tuner.fit()
 
+# ray.shutdown()
 
-# Get a dataframe for the last reported results of all of the trials
-df = results.get_dataframe()
+# reload the previous tuner
+restored_tuner = tune.Tuner.restore(path="/home/novelty/ray240_tune_ppo_tf_test/ppo_test/PPO",trainable="PPO")
+result_grid = restored_tuner.get_results()
 
+# Check if there have been errors
+if result_grid.errors:
+    print("One of the trials failed!")
+else:
+    print("No errors!")
+    
+num_results = len(result_grid)
+print("Number of results:", num_results)
 
-# reload the previous experiment
-from ray.tune import ExperimentAnalysis
-analysis = ExperimentAnalysis("./ppo_test/PPO")
+# Iterate over results
+for i, result in enumerate(result_grid):
+    if result.error:
+        print(f"Trial #{i} had an error:", result.error)
+        continue
 
-best_trial = analysis.get_best_trial(metric="episode_reward_mean", mode="max") 
+    print(
+        f"Trial #{i} finished successfully with a mean accuracy metric of:",
+        result.metrics["episode_reward_mean"]
+    )
+    
+results_df = result_grid.get_dataframe()
+results_df[["training_iteration", "episode_reward_mean"]]
 
-best_ckp = analysis.get_best_checkpoint(best_trial,metric="episode_reward_mean", mode="max")
+print("Shortest training time:", results_df["time_total_s"].min())
+print("Longest training time:", results_df["time_total_s"].max())
 
-config["lr"] = 0.0 # the below can't handle tune.grid_search and also a change to config
+best_result_df = result_grid.get_dataframe(
+    filter_metric="episode_reward_mean", filter_mode="max"
+)
+best_result_df[["training_iteration", "episode_reward_mean"]]
 
-agent = ppo.PPO(config=config, env= "CartPole-v0")
-agent.restore(best_ckp)
+from ray.air import Result
 
-policy = agent.get_policy()
+# Get the result with the maximum test set `episode_reward_mean`
+best_result: Result = result_grid.get_best_result(metric="episode_reward_mean", mode="max")
+
+# Get the result with the minimum `episode_reward_mean`
+worst_performing_result: Result = result_grid.get_best_result(
+    metric="episode_reward_mean", mode="min"
+)
+
+best_result.config
+best_result.config["lr"]
+
+best_result.log_dir
+
+# Get the last reported set of metrics
+best_result.metrics
+
+result_df = best_result.metrics_dataframe
+result_df[["training_iteration", "episode_reward_mean", "time_total_s"]]
+
+"""
+algo = PPO(config=config, env= "CartPole-v1")
+Out:
+2023-05-02 11:29:26,131	WARNING deprecation.py:50 -- DeprecationWarning: `algo = Algorithm(env='CartPole-v1', ...)` 
+has been deprecated. Use `algo = AlgorithmConfig().environment('CartPole-v1').build()` instead. 
+This will raise an error in the future!
+"""
+# right way now
+algo = (
+        PPOConfig()
+        .training(lr=best_result.config["lr"])
+        .rollouts(num_rollout_workers=4)
+        .environment('CartPole-v1')
+        .framework(framework="tf2",eager_tracing=True)
+        .resources(num_gpus=1)
+        .build()
+        )
+algo.restore(best_result.checkpoint)
+
+policy = algo.get_policy()
 fcn = policy.model # instance of ray.rllib.models.tf.fcnet.FullyConnectedNetwork
 fcn.base_model._name = "MyDefaultFcn" # give the model a more descriptive name
 fcn.base_model.summary()
 
 """
-
+Out:
 Model: "MyDefaultFcn"
 __________________________________________________________________________________________________
- Layer (type)                   Output Shape         Param #     Connected to                     
+  Layer (type)                   Output Shape         Param #     Connected to                     
 ==================================================================================================
- observations (InputLayer)      [(None, 4)]          0           []                               
+  observations (InputLayer)      [(None, 4)]          0           []                               
                                                                                                   
- fc_1 (Dense)                   (None, 256)          1280        ['observations[0][0]']           
+  fc_1 (Dense)                   (None, 256)          1280        ['observations[0][0]']           
                                                                                                   
- fc_value_1 (Dense)             (None, 256)          1280        ['observations[0][0]']           
+  fc_value_1 (Dense)             (None, 256)          1280        ['observations[0][0]']           
                                                                                                   
- fc_2 (Dense)                   (None, 256)          65792       ['fc_1[0][0]']                   
+  fc_2 (Dense)                   (None, 256)          65792       ['fc_1[0][0]']                   
                                                                                                   
- fc_value_2 (Dense)             (None, 256)          65792       ['fc_value_1[0][0]']             
+  fc_value_2 (Dense)             (None, 256)          65792       ['fc_value_1[0][0]']             
                                                                                                   
- fc_out (Dense)                 (None, 2)            514         ['fc_2[0][0]']                   
+  fc_out (Dense)                 (None, 2)            514         ['fc_2[0][0]']                   
                                                                                                   
- value_out (Dense)              (None, 1)            257         ['fc_value_2[0][0]']             
+  value_out (Dense)              (None, 1)            257         ['fc_value_2[0][0]']             
                                                                                                   
 ==================================================================================================
 Total params: 134,915
 Trainable params: 134,915
 Non-trainable params: 0
 __________________________________________________________________________________________________
-
 """
 
 fcn.base_model.save_weights("my_weights.h5")
 
-# agent.get_policy().model.base_model.load_weights("my_weights.h5")
+# algo.get_policy().model.base_model.load_weights("my_weights.h5")
 
 # fcn.base_model.save("my_model.h5")
 
-trained_weights = agent.get_policy().get_weights()
+trained_weights = algo.get_policy().get_weights()
 
-new_agent = ppo.PPO(config=config, env= "CartPole-v0")
+new_algo =  (
+            PPOConfig()
+            .training(lr=best_result.config["lr"])
+            .environment('CartPole-v1')
+            .framework(framework="tf2",eager_tracing=True)
+            .build()
+            )
 
-untrained_weights = new_agent.get_policy().get_weights()
+untrained_weights = new_algo.get_policy().get_weights()
 
 # check whether weights are equal
 
@@ -102,15 +166,15 @@ arrays_equal = all([np.array_equal(t,u) for t,u in zip(trained_weights, untraine
 
 print(f"Trained and untrained weights equal? {arrays_equal}") # False
 
-new_agent.get_policy().model.base_model.load_weights("my_weights.h5")
+new_algo.get_policy().model.base_model.load_weights("my_weights.h5")
 
-loaded_weights = new_agent.get_policy().get_weights()
+loaded_weights = new_algo.get_policy().get_weights()
 
 arrays_equal = all([np.array_equal(t,l) for t,l in zip(trained_weights, loaded_weights)])
 
 print(f"Trained and loaded weights equal? {arrays_equal}") # True
 
-del agent
+del algo
 
 class PPOalgo(ppo.PPO):
     def __init__(self, config, **kwargs):
@@ -124,50 +188,61 @@ class PPOalgo(ppo.PPO):
         """ to enable reuse of actors """
         self.config = new_config
         return True    
-
+    
+config = PPOConfig()\
+        .training(lr=0.0)\
+        .rollouts(num_rollout_workers=4)\
+        .framework(framework="tf2",eager_tracing=True)\
+        .resources(num_gpus=0)\
+        .environment(env="CartPole-v1")
+        
 # second tuning with lr = 0.0 to confirm weights are loaded and not changed
 # hence, config changed relative to first tuning
-results = tune.Tuner(
+tuner = tune.Tuner(
     PPOalgo,
-    run_config=air.RunConfig(stop={"training_iteration": 1, # note only one iteration
-                                   "episode_reward_mean": 200},
-                              local_dir="ppo_test"),
+    run_config=air.RunConfig(name="PPOalgo",
+                            stop={"training_iteration": 1, # note only one iteration
+                                    "episode_reward_mean": 450},
+                            local_dir="ppo_test"),
     param_space=config
     )
 
-results.fit()
+tuner.fit()
 
-# reload the second tuning results
-from ray.tune import ExperimentAnalysis
-analysis = ExperimentAnalysis("./ppo_test/PPOalgo_2022-10-24_21-23-42") # put the right name here
+restored_tuner = tune.Tuner.restore(path="/home/novelty/ray240_tune_ppo_tf_test/ppo_test/PPOalgo",trainable=PPOalgo)
+result_grid = restored_tuner.get_results()
+best_result: Result = result_grid.get_best_result(metric="episode_reward_mean", mode="max")
 
-best_trial = analysis.get_best_trial(metric="episode_reward_mean", mode="max") 
+print("Lets make sure we pull the right checkpoint\n and not the one created by\n the original PPO:\n", best_result.checkpoint)
 
-best_ckp = analysis.get_best_checkpoint(best_trial,metric="episode_reward_mean", mode="max")
+"""
+Out:
+Checkpoint(local_path=/home/novelty/ray240_tune_ppo_tf_test/ppo_test/PPOalgo/PPOalgo_CartPole-v1_ac5b9_00000_0_2023-05-02_12-39-53/checkpoint_000001)
+"""
+
+# We deleted the old algo so let's use new_algo and bring it up to speed
+new_algo.restore(best_result.checkpoint)
+# or do this
+# new_algo.get_policy().model.base_model.load_weights("my_weights.h5") # now able to do inferences with rllib
 
 # Now able to continue training in rllib if needed - remember to reset lr to something != 0.0 !!!
-# config["lr"] = 1e-5
+# Rebuild the new_algo again with new lr - see above
+# For now we can do inferences with rllib
 
-agent = ppo.PPO(config=config, env= "CartPole-v0")
-agent.restore(best_ckp)
-
-weights = agent.get_policy().get_weights()
+weights = new_algo.get_policy().get_weights()
 
 arrays_equal = all([np.array_equal(t,w) for t,w in zip(trained_weights, weights)]) # True => no changes as lr = 0.0
 
 print(f"Trained and recent weights equal? {arrays_equal}") # True
 
-
-agent.get_policy().model.base_model.load_weights("my_weights.h5") # now able to do inferences with rllib
-
-del agent
+del new_algo
 
 ray.shutdown()
 
 # for production without the need for ray as overhead:
 
 import tensorflow as tf
-import gym
+import gymnasium as gym
 
 class MyModel(tf.keras.Model):
 
@@ -194,9 +269,10 @@ class MyModel(tf.keras.Model):
         
         return [self.fc_out(x_out), self.value_out(x_value)]
         
-env = gym.make("CartPole-v0")
+env = gym.make("CartPole-v1")
+# env = gym.make("CartPole-v1", render_mode="human")
 model = MyModel(env.action_space.n) # pure tensorflow
-obs = env.reset()
+obs,_ = env.reset()
 obs = tf.convert_to_tensor(obs)
 obs = tf.expand_dims(obs, 0)
 model.build(obs.shape)
@@ -205,48 +281,48 @@ model._name = "MyReplica" # replica of ray default model
 model.summary()
 
 """
+Out:
 Model: "MyReplica"
 _________________________________________________________________
- Layer (type)                Output Shape              Param #   
+  Layer (type)                Output Shape              Param #   
 =================================================================
- fc_1 (Dense)                multiple                  1280      
+  fc_1 (Dense)                multiple                  1280      
                                                                  
- fc_value_1 (Dense)          multiple                  1280      
+  fc_value_1 (Dense)          multiple                  1280      
                                                                  
- fc_2 (Dense)                multiple                  65792     
+  fc_2 (Dense)                multiple                  65792     
                                                                  
- fc_value_2 (Dense)          multiple                  65792     
+  fc_value_2 (Dense)          multiple                  65792     
                                                                  
- fc_out (Dense)              multiple                  514       
+  fc_out (Dense)              multiple                  514       
                                                                  
- value_out (Dense)           multiple                  257       
+  value_out (Dense)           multiple                  257       
                                                                  
 =================================================================
 Total params: 134,915
 Trainable params: 134,915
 Non-trainable params: 0
 _________________________________________________________________
-
 """
 
 tf_weights = model.get_weights()
 
 arrays_equal = all([np.array_equal(t,tfw) for t,tfw in zip(trained_weights, tf_weights)]) 
 
-# => no changes as lr = 0.0 in last results.fit()
+# => no changes as lr = 0.0 in last tuner.fit()
 print(f"Trained and tensorflow weights equal? {arrays_equal}") # True
 
 # run until episode ends
 episode_reward = 0
-done = False
-obs = env.reset()
-while not done:
-    # env.render()
+terminated, truncated = False, False
+obs,_ = env.reset()
+while not (terminated or truncated):
     obs = tf.convert_to_tensor(obs)
     obs = tf.expand_dims(obs, 0)
     action_probs, _ = model(obs)
     action = np.random.choice(len(np.squeeze(action_probs)), p=np.squeeze(action_probs))
-    obs, reward, done, info = env.step(action)
+    obs, reward, terminated, truncated, info = env.step(action)
     episode_reward += reward
+env.close()
     
-print(f"Tensorflow agent total reward: {episode_reward}") # 200
+print(f"Tensorflow agent total reward: {episode_reward}") # app. 500
